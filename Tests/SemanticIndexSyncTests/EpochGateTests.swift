@@ -20,17 +20,26 @@ final class EpochGateTests: XCTestCase {
     /// close and semantically incomparable, which is precisely why the failure
     /// is invisible. So the test builds that case directly: a stale vector that
     /// scores 1.0, and a gate that rejects it anyway.
-    func testAStaleVectorScoringPerfectlyIsStillRejected() {
-        let values = VectorMath.l2Normalized((0..<24).map { Double(($0 % 7) + 1) })
-        let queryVector = values
+    func testAStaleVectorScoringNearPerfectlyIsStillRejected() {
+        // What the *previous* model produced for this passage, still on disk.
+        let storedInOldEpoch = VectorMath.l2Normalized((0..<24).map { Double(($0 % 7) + 1) })
+        // What the *new* model produces for the query. A different vector — as
+        // it must be, or there would be nothing to demonstrate — but a nearby
+        // one, which is what a retrained revision of the same model actually
+        // yields. Asserting `cos(v, v) == 1` instead would be a property of the
+        // cosine function, true against every implementation, and would prove
+        // nothing about this package.
+        let queryInNewEpoch = VectorMath.l2Normalized((0..<24).map { Double(($0 % 7) + 1) + 0.15 })
+        XCTAssertNotEqual(queryInNewEpoch, storedInOldEpoch)
 
-        // A naive implementation compares these directly. The arithmetic
-        // succeeds and returns the best possible score.
-        let naiveSimilarity = VectorMath.cosineSimilarity(queryVector, values)
-        XCTAssertEqual(
-            naiveSimilarity, 1.0, accuracy: 1e-12,
-            "The stale vector must score at the very top, or this test does not demonstrate the bug."
+        // A naive implementation compares them directly. The arithmetic
+        // succeeds and returns a score high enough to rank at the very top.
+        let naiveSimilarity = VectorMath.cosineSimilarity(queryInNewEpoch, storedInOldEpoch)
+        XCTAssertGreaterThan(
+            naiveSimilarity, 0.9,
+            "The stale vector must score near the top, or this test does not demonstrate the bug."
         )
+        let values = storedInOldEpoch
 
         let chunk = Chunk(
             id: ChunkID(document: DocumentID("d"), ordinal: 0),

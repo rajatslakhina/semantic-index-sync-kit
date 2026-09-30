@@ -73,11 +73,25 @@ final class LexicalIndexTests: XCTestCase {
         XCTAssertNotNil(scores[ChunkID(document: DocumentID("d"), ordinal: 0)])
     }
 
-    func testDegenerateParametersAreClamped() {
-        let index = LexicalIndex(k1: .nan, b: 12)
-        let scores = index.scores(for: "alpha", over: [chunk(0, "alpha beta")])
-        XCTAssertEqual(scores.count, 1)
-        for score in scores.values { XCTAssertTrue(score.isFinite) }
+    /// Out-of-range parameters are clamped at construction rather than trusted.
+    /// Asserting only that a score comes back finite would pass unclamped, so
+    /// the stored values are checked against a known-good instance too.
+    func testDegenerateParametersAreClampedToTheSameBehaviourAsValidOnes() {
+        let corpus = (0..<4).map { chunk($0, "alpha beta passage \($0)") }
+        let degenerate = LexicalIndex(k1: .nan, b: 12)
+        let valid = LexicalIndex(k1: 1.2, b: 1.0)
+
+        let degenerateScores = degenerate.scores(for: "alpha", over: corpus)
+        let validScores = valid.scores(for: "alpha", over: corpus)
+
+        XCTAssertEqual(degenerateScores.count, corpus.count)
+        // `b` clamped to 1.0 and `k1` to its default must reproduce the valid
+        // instance exactly — an unclamped `b: 12` produces different numbers.
+        for (id, score) in degenerateScores {
+            guard let expected = validScores[id] else { return XCTFail("Missing \(id)") }
+            XCTAssertEqual(score, expected, accuracy: 1e-12, "Clamping did not normalise \(id)")
+            XCTAssertTrue(score.isFinite)
+        }
     }
 }
 

@@ -106,27 +106,23 @@ final class ReentrancyTests: XCTestCase {
         let first = Task { await coordinator.drainMigration(budget: .foregroundInteractive, conditions: DeviceConditions()) }
         await gate.waitUntilEntered()
 
-        // Starts while the first pass is genuinely parked inside `embed`.
+        // Asserted synchronously while the first pass is genuinely parked inside
+        // `embed`, against the very function `drainMigration` uses to choose its
+        // batch.
         //
-        // Bounded, because without the in-flight guard the overlapping pass
-        // parks on the same gate and this call never returns — and a test that
-        // *hangs* under a mutation is not a test that catches it: XCTest has no
-        // per-test timeout here, so it would burn a CI job to the job ceiling
-        // with no failing assertion and no diagnostic. The deadline is a failure
-        // bound, not a synchronisation primitive; nothing in this suite waits a
-        // fixed time and then assumes something happened.
-        guard let second = await withDeadline(seconds: 5, {
-            await coordinator.drainMigration(budget: .foregroundInteractive, conditions: DeviceConditions())
-        }) else {
-            await gate.release()
-            _ = await first.value
-            return XCTFail("The overlapping pass never returned — it took the same work and parked on the provider.")
-        }
-        guard case .alreadyDraining = second else {
-            await gate.release()
-            _ = await first.value
-            return XCTFail("The overlapping pass must not take the same work; got \(second)")
-        }
+        // Deliberately *not* by starting a second `drainMigration` here: without
+        // the guard, that call parks on the same gate and never returns, so the
+        // regression would make this test **hang** rather than fail. XCTest has
+        // no per-test timeout, so a hang burns a CI job to its ceiling with no
+        // failing assertion and no diagnostic. Racing it against a timeout does
+        // not help either — `withTaskGroup` waits for every child before its
+        // scope exits, so a stuck child blocks the race too. Asserting the
+        // selection directly is what turns the regression into a named failure.
+        let availableWhileParked = await coordinator.availableBatch(limit: 10)
+        XCTAssertTrue(
+            availableWhileParked.isEmpty,
+            "A second pass would take \(availableWhileParked.count) chunks the first pass is already embedding."
+        )
 
         await gate.release()
         let firstOutcome = await first.value
