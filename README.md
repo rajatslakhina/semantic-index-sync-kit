@@ -9,7 +9,7 @@ A cosine similarity between a query vector from model revision 4 and a stored ve
 It also answers the second half of the problem, which shows up the moment the user has more than one device: how a delete performed offline on the phone is not undone by an edit that arrives later from the laptop.
 
 - **Library repo:** you are here.
-- **Demo app:** *(added after the companion repo is pushed — see below)*
+- **Demo app:** [**semantic-index-sync-kit-demo**](https://github.com/rajatslakhina/semantic-index-sync-kit-demo) — a separate Xcode project that consumes this package over the network at a released version, exactly as a real client would.
 
 ---
 
@@ -229,11 +229,11 @@ swift test                                  # 98 tests
 - **Clean build, zero warnings.** `rm -rf .build && swift build -Xswiftc -warnings-as-errors` with **Swift 6.1.2 on Linux (x86_64)** — a *clean* build, because an incremental one compiles nothing and still prints `Build complete!`.
 - **98 of 98 tests passing** under `swift test` on that toolchain.
 - **Mutation check:** three deliberate invariant breaks produced 10 failures, run locally before this release.
-- **CI** runs the same clean build and test on Linux and on macOS, plus an iOS Simulator compile. Live status for every commit is on the [Actions tab](../../actions) — preferred over a run ID here, which goes stale on the next commit.
+- **CI** runs the same clean build and test on Linux and on macOS, plus an iOS Simulator compile — and it passed on the `v2.0.0` commit, which is what establishes that `IndexWorkbenchView.swift` compiles at all (see below). Live status for every commit is on the [Actions tab](../../actions) — preferred over a run ID here, which goes stale on the next commit.
 
-**What is *not* covered, stated rather than left to be discovered.** `IndexWorkbenchView.swift` is behind `#if canImport(SwiftUI)`, so the Linux build compiles it to nothing: it has never been compiled on the machine that produced this release, and the `ios-simulator` CI job is the only thing that compiles it at all. Everything else in `SemanticIndexSyncUI` — the view model, the configuration and the scenario builder — is deliberately **not** behind that guard, so it is compiled and tested on Linux like the rest.
+**What is *not* covered locally, stated rather than left to be discovered.** `IndexWorkbenchView.swift` is behind `#if canImport(SwiftUI)`, so the Linux build compiles it to nothing — it was never compiled on the machine that produced this release. The `ios-simulator` CI job is the only thing that compiles it, and on the `v2.0.0` commit that job passed. Nothing here has been *run*, though: no Simulator launch, no screenshots. Compiling is not launching, and the two are never treated as the same claim. Everything else in `SemanticIndexSyncUI` — the view model, the configuration and the scenario builder — is deliberately **not** behind that guard, so it is compiled and tested on Linux like the rest.
 
-The companion demo app's README states separately, and without conflation, whether the app was *built* for a Simulator and whether it was *run* on one.
+The [companion demo app's README](https://github.com/rajatslakhina/semantic-index-sync-kit-demo#verification--exactly-what-happened) states separately, and without conflation, whether that app was *built* for a Simulator and whether it was *run* on one. (It was built; it was not run.)
 
 ---
 
