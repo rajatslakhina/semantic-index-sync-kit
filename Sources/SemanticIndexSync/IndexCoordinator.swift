@@ -59,13 +59,24 @@ public actor IndexCoordinator {
     private var pending: [ChunkID] = []
     private var pendingSet: Set<ChunkID> = []
 
-    /// Chunks a drain pass has handed to the provider and is awaiting.
+    /// Chunks a drain pass has handed to the provider and is awaiting, mapped to
+    /// the token of the pass that owns each claim.
     ///
     /// Without this, two concurrent drains take the same prefix of `pending`,
-    /// embed the same chunks twice, and both count their work — burning the
-    /// exact battery budget ``WorkBudget`` exists to conserve and reporting a
-    /// migration total larger than the corpus.
-    private var inFlight: Set<ChunkID> = []
+    /// embed the same chunks twice, and both burn the battery budget
+    /// ``WorkBudget`` exists to conserve.
+    ///
+    /// The *token* matters as much as the set. Releasing by chunk id alone lets a
+    /// resuming pass free a claim it no longer owns: an edit mid-flight drops the
+    /// first pass's claim and re-queues the chunk, a second pass legitimately
+    /// claims it, and then the first pass wakes up and deletes the second's
+    /// claim — after which a third pass takes the same chunk and embeds it again.
+    /// A pass may only release what it still holds.
+    private var inFlight: [ChunkID: UInt64] = [:]
+
+    /// Monotonic id for drain passes. Saturates rather than wrapping, so two
+    /// passes can never share a token.
+    private var nextPassToken: UInt64 = 0
 
     // MARK: Init
 
@@ -158,7 +169,7 @@ public actor IndexCoordinator {
                 problems.append("covered chunk is still queued: \(chunk.id)")
             }
         }
-        if !inFlight.isSubset(of: pendingSet) {
+        if !Set(inFlight.keys).isSubset(of: pendingSet) {
             problems.append("in-flight chunks are not all queued")
         }
         for id in pending {
@@ -235,14 +246,12 @@ public actor IndexCoordinator {
         let owned = chunks.keys.filter { $0.document == document }
         for id in owned {
             chunks.removeValue(forKey: id)
-            // Every epoch's vector for this chunk, not just the active one:
-            // a vector left behind after a tombstone is the concrete shape of
-            // "deleted content is still searchable".
+            // Every epoch's vector for this chunk, not just the active one.
             for key in vectors.keys where key.chunk == id {
                 vectors.removeValue(forKey: key)
             }
             pendingSet.remove(id)
-            inFlight.remove(id)
+            inFlight.removeValue(forKey: id)
         }
         if !owned.isEmpty {
             let removed = Set(owned)
@@ -341,8 +350,6 @@ public actor IndexCoordinator {
 
     /// Drop vectors that belong to no listed epoch. Called after a migration has
     /// settled, to reclaim the disk that ``adopt(provider:)`` deliberately spends.
-    /// Drop vectors that belong to no listed epoch. Called after a migration has
-    /// settled, to reclaim the disk that ``adopt(provider:)`` deliberately spends.
     ///
     /// Any live chunk left without a usable vector in the active epoch is
     /// re-queued here. Skipping that step would strand the chunk: unsearchable
@@ -380,9 +387,8 @@ public actor IndexCoordinator {
 
         // Skip chunks another pass is already embedding. Taking the same prefix
         // twice is the concurrency bug this guard exists to prevent.
-        let available = pending.filter { !inFlight.contains($0) }
-        guard !available.isEmpty else { return .alreadyDraining(migrationProgress) }
-        let batch = Array(available.prefix(budget.maxChunksPerPass))
+        let batch = availableBatch(limit: budget.maxChunksPerPass)
+        guard !batch.isEmpty else { return .alreadyDraining(migrationProgress) }
 
         // Snapshot the exact text each vector will describe, so a post-await
         // comparison can tell "still the same text" from "edited underneath us".
@@ -401,8 +407,10 @@ public actor IndexCoordinator {
                 : .progressed(migrationProgress)
         }
 
-        // Claim them before suspending.
-        for entry in snapshot { inFlight.insert(entry.id) }
+        // Claim them before suspending, under this pass's own token.
+        let passToken = nextPassToken
+        nextPassToken = nextPassToken == UInt64.max ? UInt64.max : nextPassToken &+ 1
+        for entry in snapshot { inFlight[entry.id] = passToken }
 
         let embedded: [[Double]]
         do {
@@ -411,13 +419,13 @@ public actor IndexCoordinator {
             // Released and left queued on purpose: a provider failure is
             // transient, and silently dropping the chunks would leave them
             // permanently unsearchable with no record of why.
-            for entry in snapshot { inFlight.remove(entry.id) }
+            releaseClaims(of: snapshot.map(\.id), heldBy: passToken)
             return .providerFailed(String(describing: error))
         }
 
         // ---- Everything below re-reads current state. The snapshot above is
         // ---- only used to detect what changed across the suspension point.
-        for entry in snapshot { inFlight.remove(entry.id) }
+        releaseClaims(of: snapshot.map(\.id), heldBy: passToken)
 
         guard activeEpoch == epochAtStart else {
             // A second epoch bump landed while we were embedding. These vectors
@@ -479,12 +487,37 @@ public actor IndexCoordinator {
         return pending.isEmpty ? .finished(migrationProgress) : .progressed(migrationProgress)
     }
 
+    /// The queued chunks no other pass is already embedding.
+    ///
+    /// Factored out of ``drainMigration(budget:conditions:)`` so the guard is
+    /// directly assertable while a pass is parked in the provider. Testing it
+    /// only through a second `drainMigration` call would mean that removing the
+    /// guard makes the test *hang* rather than fail — and a test that hangs
+    /// under a regression is not a test that catches it.
+    internal func availableBatch(limit: Int) -> [ChunkID] {
+        guard limit > 0 else { return [] }
+        var batch: [ChunkID] = []
+        batch.reserveCapacity(min(limit, pending.count))
+        for id in pending where inFlight[id] == nil {
+            batch.append(id)
+            if batch.count == limit { break }
+        }
+        return batch
+    }
+
+    /// Releases only the claims this pass still owns.
+    private func releaseClaims(of ids: [ChunkID], heldBy token: UInt64) {
+        for id in ids where inFlight[id] == token {
+            inFlight.removeValue(forKey: id)
+        }
+    }
+
     private func dequeue(_ ids: [ChunkID]) {
         guard !ids.isEmpty else { return }
         let set = Set(ids)
         for id in set {
             pendingSet.remove(id)
-            inFlight.remove(id)
+            inFlight.removeValue(forKey: id)
         }
         pending.removeAll { set.contains($0) }
     }
