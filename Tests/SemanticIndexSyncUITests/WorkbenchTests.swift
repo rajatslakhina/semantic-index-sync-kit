@@ -79,15 +79,24 @@ final class OfflineEditScenarioTests: XCTestCase {
         XCTAssertGreaterThan(peerHash, localEdit.hash)
     }
 
-    func testASingleLiveDocumentStillProducesTheDeleteConflict() {
-        let live = [DocumentRecord.live(DocumentID("only"), hash: ContentHash("v1"), by: local)]
-        guard let plan = OfflineEditScenario.make(from: live, peer: peer) else {
+    func testASingleLiveDocumentStillProducesAConcurrentDeleteConflict() {
+        let base = DocumentRecord.live(DocumentID("only"), hash: ContentHash("v1"), by: local)
+        guard let plan = OfflineEditScenario.make(from: [base], peer: peer) else {
             return XCTFail("Expected a plan.")
         }
         XCTAssertEqual(plan.localEdits.count, 1)
         XCTAssertEqual(plan.peerRecords.count, 1)
         XCTAssertTrue(plan.peerRecords[0].state.isTombstone)
         XCTAssertTrue(plan.peerPassages.isEmpty)
+
+        // The counts above would all hold for a peer record built from the
+        // *current* local version — the exact regression this file exists to
+        // catch — so the causal relationship is asserted here too.
+        let localAfterEdit = base.edited(to: plan.localEdits[0].hash, by: local)
+        XCTAssertEqual(
+            VersionVector.order(localAfterEdit.version, plan.peerRecords[0].version), .concurrent,
+            "A dominating peer delete would be handled correctly by last-writer-wins too, and would prove nothing."
+        )
     }
 }
 
