@@ -1,17 +1,20 @@
-#if canImport(SwiftUI)
 import Foundation
 import SemanticIndexSync
 
 /// A document the workbench seeds its index with.
+///
+/// Note the shape of `hash`: the fingerprint is derived from the document id and
+/// a caller-supplied revision label, never from the passage text. That mirrors
+/// how a real app works — the hash comes from whatever the storage layer already
+/// knows about a revision — and it is why editing `passages` without bumping
+/// `revision` would (correctly) leave existing vectors considered fresh.
 public struct SeedDocument: Sendable, Identifiable, Equatable {
     public let id: DocumentID
-    public let title: String
     public let passages: [String]
     public let hash: ContentHash
 
-    public init(id: String, title: String, passages: [String], revision: String) {
+    public init(id: String, passages: [String], revision: String) {
         self.id = DocumentID(id)
-        self.title = title
         self.passages = passages
         self.hash = ContentHash("\(id)-\(revision)")
     }
@@ -54,4 +57,3 @@ public struct WorkbenchConfiguration: Sendable {
         self.initialQuery = initialQuery
     }
 }
-#endif

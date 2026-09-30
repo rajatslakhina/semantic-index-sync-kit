@@ -1,5 +1,11 @@
 #if canImport(SwiftUI)
+import Foundation
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
 import SemanticIndexSync
 
 /// The demo surface: a semantic index you can watch go partially blind during an
@@ -140,13 +146,16 @@ public struct IndexWorkbenchView: View {
                 }
 
                 Button {
-                    Task { await model.shipModelUpdate() }
+                    Task { await model.toggleModelRevision() }
                 } label: {
-                    Label("Ship an OS model revision", systemImage: "arrow.up.circle")
-                        .frame(maxWidth: .infinity)
+                    Label(
+                        model.isOnUpgradedEpoch ? "Roll the model revision back" : "Ship an OS model revision",
+                        systemImage: model.isOnUpgradedEpoch ? "arrow.uturn.backward.circle" : "arrow.up.circle"
+                    )
+                    .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
-                .disabled(model.hasUpgraded || model.isWorking)
+                .disabled(model.isWorking)
 
                 Divider()
 
@@ -186,19 +195,35 @@ public struct IndexWorkbenchView: View {
     private var syncCard: some View {
         Card(title: "Peer sync") {
             VStack(alignment: .leading, spacing: 10) {
-                Text("Applies a batch containing a delete performed offline on the peer and a concurrent edit. A clock-based merge resurrects the delete; the version-vector merge does not.")
+                Text("Both devices edit while offline, from the same shared history: this one edits two documents, the peer deletes one and edits the other. Neither write saw the other, so the merge is genuinely concurrent — the case a clock-based merge cannot represent.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                Button {
-                    Task { await model.syncFromPeer() }
-                } label: {
-                    Label("Sync from peer device", systemImage: "arrow.triangle.2.circlepath")
-                        .frame(maxWidth: .infinity)
+                Text("The peer's delete wins its conflict, so each sync retires one document. Reset to start over.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: 8) {
+                    Button {
+                        Task { await model.syncFromPeer() }
+                    } label: {
+                        Label("Sync from peer", systemImage: "arrow.triangle.2.circlepath")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(model.isWorking)
+
+                    Button {
+                        Task { await model.reset() }
+                    } label: {
+                        Label("Reset", systemImage: "arrow.counterclockwise")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(model.isWorking)
                 }
-                .buttonStyle(.bordered)
-                .disabled(model.isWorking)
             }
         }
     }
@@ -242,9 +267,11 @@ public struct IndexWorkbenchView: View {
     }
 
     private func percentText(_ fraction: Double) -> String {
+        // Through `Saturating` like every other Double-to-Int conversion in the
+        // package, rather than a hand-written guard beside it. A second way of
+        // doing the same thing is how the audited one stops being the only one.
         let clamped = fraction.isFinite ? min(max(fraction, 0), 1) : 0
-        let percent = Int((clamped * 100).rounded())
-        return "\(percent)%"
+        return "\(Saturating.int(clamping: (clamped * 100).rounded()))%"
     }
 }
 
