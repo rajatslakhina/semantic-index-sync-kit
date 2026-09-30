@@ -24,6 +24,12 @@ import Foundation
 /// back on the strength of a pre-await snapshot.
 public actor IndexCoordinator {
 
+    /// Identity of a stored vector: which chunk, in which embedding space.
+    struct VectorKey: Hashable, Sendable {
+        let chunk: ChunkID
+        let epoch: EmbeddingEpoch
+    }
+
     // MARK: Stored state
 
     private let device: DeviceID
@@ -32,7 +38,16 @@ public actor IndexCoordinator {
 
     private var manifest: [DocumentID: DocumentRecord] = [:]
     private var chunks: [ChunkID: Chunk] = [:]
-    private var vectors: [ChunkID: StoredVector] = [:]
+
+    /// Keyed by chunk **and** epoch, not by chunk alone.
+    ///
+    /// Keying by chunk alone would make a new vector overwrite the previous
+    /// epoch's, which quietly turns the retention policy documented on
+    /// ``adopt(provider:)`` into a lie: a rollback would find nothing and
+    /// trigger a second full re-index. The extra key component is what makes
+    /// "keep the old space until the new one has settled" an actual behaviour
+    /// rather than a comment.
+    private var vectors: [VectorKey: StoredVector] = [:]
 
     private var provider: any EmbeddingProvider
     /// The epoch every *new* vector is produced in and every query is embedded in.
@@ -43,7 +58,14 @@ public actor IndexCoordinator {
     /// a random subset — and so progress is reproducible in tests.
     private var pending: [ChunkID] = []
     private var pendingSet: Set<ChunkID> = []
-    private var migratedInCurrentEpoch = 0
+
+    /// Chunks a drain pass has handed to the provider and is awaiting.
+    ///
+    /// Without this, two concurrent drains take the same prefix of `pending`,
+    /// embed the same chunks twice, and both count their work — burning the
+    /// exact battery budget ``WorkBudget`` exists to conserve and reporting a
+    /// migration total larger than the corpus.
+    private var inFlight: Set<ChunkID> = []
 
     // MARK: Init
 
@@ -68,10 +90,27 @@ public actor IndexCoordinator {
             .sorted { $0.id < $1.id }
     }
 
+    /// Progress toward having the whole live corpus in the active epoch.
+    ///
+    /// **Derived, not accumulated.** A running counter of "chunks embedded since
+    /// the last `adopt`" drifts away from the index the moment a chunk is
+    /// deleted or re-written after being embedded: the count keeps the work, the
+    /// corpus loses the chunk, and `total` grows past the number of passages
+    /// that exist — which is exactly the fabricated denominator a progress bar
+    /// would then render. Computing coverage from current state instead makes
+    /// `completed + remaining == liveChunks.count` true by construction, and
+    /// removes a whole class of accounting bug rather than guarding against it.
     public var migrationProgress: MigrationProgress {
-        MigrationProgress(
+        var covered = 0
+        for chunk in liveChunks {
+            let key = VectorKey(chunk: chunk.id, epoch: activeEpoch)
+            if let vector = vectors[key], vector.isFresh(for: chunk, in: activeEpoch) {
+                covered = Saturating.add(covered, 1)
+            }
+        }
+        return MigrationProgress(
             targetEpoch: activeEpoch,
-            completed: migratedInCurrentEpoch,
+            completed: covered,
             remaining: pending.count
         )
     }
@@ -100,9 +139,27 @@ public actor IndexCoordinator {
     internal func invariantViolations() -> [String] {
         var problems: [String] = []
 
-        for id in vectors.keys {
+        for key in vectors.keys {
+            let id = key.chunk
             if chunks[id] == nil { problems.append("vector without chunk: \(id)") }
             else if !isLive(id.document) { problems.append("vector survived tombstone: \(id)") }
+        }
+        // The invariant the one-actor design is justified by: the queue holds
+        // exactly the live chunks that lack a usable vector in the active epoch.
+        // Checking only the other direction would miss a stranded chunk — one
+        // with no vector and no queue entry, permanently unsearchable.
+        for chunk in chunks.values where isLive(chunk.id.document) {
+            let key = VectorKey(chunk: chunk.id, epoch: activeEpoch)
+            let covered = vectors[key]?.isFresh(for: chunk, in: activeEpoch) ?? false
+            if !covered && !pendingSet.contains(chunk.id) {
+                problems.append("live chunk is neither covered nor queued: \(chunk.id)")
+            }
+            if covered && pendingSet.contains(chunk.id) {
+                problems.append("covered chunk is still queued: \(chunk.id)")
+            }
+        }
+        if !inFlight.isSubset(of: pendingSet) {
+            problems.append("in-flight chunks are not all queued")
         }
         for id in pending {
             if chunks[id] == nil { problems.append("queued chunk no longer exists: \(id)") }
@@ -178,8 +235,14 @@ public actor IndexCoordinator {
         let owned = chunks.keys.filter { $0.document == document }
         for id in owned {
             chunks.removeValue(forKey: id)
-            vectors.removeValue(forKey: id)
+            // Every epoch's vector for this chunk, not just the active one:
+            // a vector left behind after a tombstone is the concrete shape of
+            // "deleted content is still searchable".
+            for key in vectors.keys where key.chunk == id {
+                vectors.removeValue(forKey: key)
+            }
             pendingSet.remove(id)
+            inFlight.remove(id)
         }
         if !owned.isEmpty {
             let removed = Set(owned)
@@ -259,27 +322,48 @@ public actor IndexCoordinator {
         guard newEpoch != activeEpoch else { return migrationProgress }
 
         activeEpoch = newEpoch
-        migratedInCurrentEpoch = 0
         pending.removeAll(keepingCapacity: true)
         pendingSet.removeAll(keepingCapacity: true)
+        // Any pass still suspended in the provider is now working for a space
+        // nobody queries; it will discard its results on resume. Releasing its
+        // claim here keeps `inFlight` a subset of the queue — otherwise a later
+        // pass would skip a chunk that nothing is actually working on and report
+        // `.alreadyDraining` about a pass that no longer exists.
+        inFlight.removeAll(keepingCapacity: true)
 
         for chunk in liveChunks {
-            if let vector = vectors[chunk.id], vector.isFresh(for: chunk, in: newEpoch) {
-                migratedInCurrentEpoch = Saturating.add(migratedInCurrentEpoch, 1)
-            } else {
-                enqueue(chunk.id)
-            }
+            let key = VectorKey(chunk: chunk.id, epoch: newEpoch)
+            let covered = vectors[key]?.isFresh(for: chunk, in: newEpoch) ?? false
+            if !covered { enqueue(chunk.id) }
         }
         return migrationProgress
     }
 
     /// Drop vectors that belong to no listed epoch. Called after a migration has
     /// settled, to reclaim the disk that ``adopt(provider:)`` deliberately spends.
+    /// Drop vectors that belong to no listed epoch. Called after a migration has
+    /// settled, to reclaim the disk that ``adopt(provider:)`` deliberately spends.
+    ///
+    /// Any live chunk left without a usable vector in the active epoch is
+    /// re-queued here. Skipping that step would strand the chunk: unsearchable
+    /// by meaning, absent from the re-index queue, and therefore never
+    /// recoverable — an index permanently stuck below full coverage while every
+    /// internal check still reports it healthy.
     @discardableResult
     public func discardVectors(outside keep: Set<EmbeddingEpoch>) -> Int {
-        let doomed = vectors.filter { !keep.contains($0.value.epoch) }.map(\.key)
-        for id in doomed { vectors.removeValue(forKey: id) }
+        let doomed = vectors.keys.filter { !keep.contains($0.epoch) }
+        for key in doomed { vectors.removeValue(forKey: key) }
+        requeueUncoveredChunks()
         return doomed.count
+    }
+
+    /// Re-queues every live chunk that lacks a fresh vector in the active epoch.
+    private func requeueUncoveredChunks() {
+        for chunk in liveChunks {
+            let key = VectorKey(chunk: chunk.id, epoch: activeEpoch)
+            if let vector = vectors[key], vector.isFresh(for: chunk, in: activeEpoch) { continue }
+            enqueue(chunk.id)
+        }
     }
 
     /// Do at most one budgeted pass of re-embedding.
@@ -292,10 +376,14 @@ public actor IndexCoordinator {
         guard provider.isAvailable else { return .providerFailed("provider unavailable") }
 
         let epochAtStart = activeEpoch
-        let batchSize = min(budget.maxChunksPerPass, pending.count)
-        guard batchSize > 0 else { return .deferred(.zeroAllowance) }
+        guard budget.maxChunksPerPass > 0 else { return .deferred(.zeroAllowance) }
 
-        let batch = Array(pending.prefix(batchSize))
+        // Skip chunks another pass is already embedding. Taking the same prefix
+        // twice is the concurrency bug this guard exists to prevent.
+        let available = pending.filter { !inFlight.contains($0) }
+        guard !available.isEmpty else { return .alreadyDraining(migrationProgress) }
+        let batch = Array(available.prefix(budget.maxChunksPerPass))
+
         // Snapshot the exact text each vector will describe, so a post-await
         // comparison can tell "still the same text" from "edited underneath us".
         var snapshot: [(id: ChunkID, chunk: Chunk)] = []
@@ -313,24 +401,32 @@ public actor IndexCoordinator {
                 : .progressed(migrationProgress)
         }
 
+        // Claim them before suspending.
+        for entry in snapshot { inFlight.insert(entry.id) }
+
         let embedded: [[Double]]
         do {
             embedded = try await provider.embed(snapshot.map(\.chunk.text))
         } catch {
-            // Left queued on purpose: a provider failure is transient, and
-            // silently dropping the chunks would leave them permanently
-            // unsearchable with no record of why.
+            // Released and left queued on purpose: a provider failure is
+            // transient, and silently dropping the chunks would leave them
+            // permanently unsearchable with no record of why.
+            for entry in snapshot { inFlight.remove(entry.id) }
             return .providerFailed(String(describing: error))
         }
 
         // ---- Everything below re-reads current state. The snapshot above is
         // ---- only used to detect what changed across the suspension point.
+        for entry in snapshot { inFlight.remove(entry.id) }
 
         guard activeEpoch == epochAtStart else {
             // A second epoch bump landed while we were embedding. These vectors
-            // are for a space nobody queries any more; discarding them is
-            // correct, and `adopt` has already rebuilt the queue.
-            return .deferred(.zeroAllowance)
+            // describe a space nobody queries any more, so they are discarded —
+            // but this is emphatically NOT a budget refusal. Reporting it as one
+            // would put "budget allows zero chunks" in a log line about a pass
+            // the budget admitted, and tell the reader the queue was untouched
+            // when `adopt` has just rebuilt it. It gets its own case.
+            return .abandoned(supersededBy: activeEpoch)
         }
 
         guard embedded.count == snapshot.count else {
@@ -339,7 +435,7 @@ public actor IndexCoordinator {
             )
         }
 
-        var applied = 0
+        var satisfied: Set<ChunkID> = []
         for (offset, entry) in snapshot.enumerated() {
             guard embedded.indices.contains(offset) else { continue }
             let values = embedded[offset]
@@ -351,15 +447,27 @@ public actor IndexCoordinator {
                 // longer there; leave the chunk queued for the next pass.
                 continue
             }
-            vectors[entry.id] = StoredVector(
+            guard pendingSet.contains(entry.id) else {
+                // Already satisfied by another pass while we were suspended.
+                continue
+            }
+            vectors[VectorKey(chunk: entry.id, epoch: epochAtStart)] = StoredVector(
                 chunk: entry.id,
                 epoch: epochAtStart,
                 sourceHash: current.sourceHash,
                 values: values
             )
             pendingSet.remove(entry.id)
-            pending.removeAll { $0 == entry.id }
-            applied = Saturating.add(applied, 1)
+            satisfied.insert(entry.id)
+        }
+
+        // One pass over the queue instead of one per embedded chunk: the inner
+        // `removeAll` made a budgeted pass O(batch x queue), which at the corpus
+        // size this package targets is 128 x 50_000 array scans — in the one
+        // code path whose entire justification is spending as little of the
+        // user's device as possible.
+        if !satisfied.isEmpty {
+            pending.removeAll { satisfied.contains($0) }
         }
 
         // Chunks from this slice that vanished entirely (deleted mid-flight) are
@@ -368,14 +476,16 @@ public actor IndexCoordinator {
         let vanished = batch.filter { !survivors.contains($0) }
         dequeue(vanished)
 
-        migratedInCurrentEpoch = Saturating.add(migratedInCurrentEpoch, applied)
         return pending.isEmpty ? .finished(migrationProgress) : .progressed(migrationProgress)
     }
 
     private func dequeue(_ ids: [ChunkID]) {
         guard !ids.isEmpty else { return }
         let set = Set(ids)
-        for id in set { pendingSet.remove(id) }
+        for id in set {
+            pendingSet.remove(id)
+            inFlight.remove(id)
+        }
         pending.removeAll { set.contains($0) }
     }
 
@@ -385,9 +495,9 @@ public actor IndexCoordinator {
     public func search(_ text: String, limit: Int = 10) async -> QueryResult {
         let corpus = liveChunks
         let cappedLimit = max(0, min(limit, corpus.count))
-        let lexicalScores = lexical.scores(for: text, over: corpus)
 
         guard provider.isAvailable else {
+            let lexicalScores = lexical.scores(for: text, over: corpus)
             let completeness = Completeness(
                 liveChunks: corpus.count,
                 semanticallyCovered: 0,
@@ -415,13 +525,21 @@ public actor IndexCoordinator {
             }
             queryVector = first
         } catch {
+            // Re-read: the corpus may have moved while the query was embedding,
+            // so the scores must be computed over what is live *now*.
+            let fallbackCorpus = liveChunks
             let completeness = Completeness(
-                liveChunks: corpus.count,
+                liveChunks: fallbackCorpus.count,
                 semanticallyCovered: 0,
-                awaitingReindex: corpus.count,
+                awaitingReindex: fallbackCorpus.count,
                 isLexicalOnly: true
             )
-            let hits = Self.rank(corpus: corpus, semantic: [:], lexical: lexicalScores, limit: cappedLimit)
+            let hits = Self.rank(
+                corpus: fallbackCorpus,
+                semantic: [:],
+                lexical: lexical.scores(for: text, over: fallbackCorpus),
+                limit: max(0, min(limit, fallbackCorpus.count))
+            )
             return QueryResult(hits: hits, completeness: completeness, epoch: nil)
         }
 
@@ -432,7 +550,8 @@ public actor IndexCoordinator {
         var covered = 0
 
         for chunk in currentCorpus {
-            guard let vector = vectors[chunk.id], vector.isFresh(for: chunk, in: epoch) else {
+            let key = VectorKey(chunk: chunk.id, epoch: epoch)
+            guard let vector = vectors[key], vector.isFresh(for: chunk, in: epoch) else {
                 // The epoch gate. A vector from another space is *not* scored at
                 // a lower weight or scaled — it is not comparable at all, and
                 // scoring it would return a confident, meaningless number.
@@ -443,9 +562,13 @@ public actor IndexCoordinator {
             if similarity > 0 { semanticScores[chunk.id] = similarity }
         }
 
-        let currentLexical = currentCorpus.count == corpus.count
-            ? lexicalScores
-            : lexical.scores(for: text, over: currentCorpus)
+        // Always recomputed over the corpus as it is *now*. Reusing scores
+        // computed before the suspension point on the strength of an unchanged
+        // element count would be wrong: a delete and an upsert that interleave
+        // leave the count identical and the membership different, and the
+        // min-max normalisation would then be taken over a range that partly
+        // belongs to chunks which are no longer there.
+        let currentLexical = lexical.scores(for: text, over: currentCorpus)
 
         let completeness = Completeness(
             liveChunks: currentCorpus.count,
