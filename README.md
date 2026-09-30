@@ -128,7 +128,7 @@ Concurrent *live* edits fall through to higher content hash, then writer identit
 
 There is a fourth, smaller lesson in the same method: a mid-flight epoch bump returns its own `.abandoned(supersededBy:)` case rather than borrowing `.deferred(.zeroAllowance)`. Borrowing was tempting and wrong — the budget *admitted* that pass, and the queue was *not* left untouched — and it would have put a sentence in the support log that is false in both halves.
 
-Four tests park a provider mid-`embed` using a continuation rendezvous — there is no `Task.sleep` anywhere in the suite — and assert both properties, including that an overlapping pass reports `.alreadyDraining` rather than doing the work twice.
+Five tests park a provider mid-`embed` using a continuation rendezvous — there is no `Task.sleep` anywhere in the suite — and assert both properties. The overlapping-pass case is asserted against `availableBatch` *while* the first pass is parked, rather than by starting a second `drainMigration`: without the guard that second call would park on the same provider and the test would **hang** instead of failing, and a test that hangs under a regression is not a test that catches it.
 
 ### 6. No model, by design
 
@@ -156,17 +156,17 @@ This is a package that runs in a background task where a trap is a silent failur
 
 - For the two properties this README makes the loudest claims about, a **deliberately broken implementation is fed in and asserted to fail**:
   - `ReconcilerTests` implements `LastWriterWinsReconciler` inline and asserts it resurrects the tombstone before asserting the real reconciler does not.
-  - `EpochGateTests` constructs a stale-epoch vector that scores a **perfect 1.0**, asserts that score first — *i.e. that a naive implementation would rank it at the very top* — and only then asserts the gate rejects it anyway. (It builds those vectors explicitly rather than using this package's own embedder, which salts tokens with the revision and so makes the two spaces exactly orthogonal — a cross-epoch cosine of 0, which a naive implementation would *not* rank and which would therefore prove nothing. Real models are not orthogonal across revisions; that is why the failure is invisible.)
+  - `EpochGateTests` scores a *different* query vector — what a retrained revision of the same model would produce — against the stale one, asserts the result is **above 0.9** first (*i.e. that a naive implementation would rank it at the very top*), and only then asserts the gate rejects it anyway. Asserting `cos(v, v) == 1` instead would be a property of the cosine function, true against every implementation, and would prove nothing. (It builds those vectors explicitly rather than using this package's own embedder, which salts tokens with the revision and so makes the two spaces exactly orthogonal — a cross-epoch cosine of 0, which a naive implementation would *not* rank and which would therefore prove nothing. Real models are not orthogonal across revisions; that is why the failure is invisible.)
 - **No self-fulfilling assertions.** Exact expected values, not bounds the implementation satisfies by construction — migration coverage is checked as `4 → 0 → 2 → 4`, not "greater than zero"; `discardVectors` is checked as "exactly 4 reclaimed and exactly 4 re-queued", not "≥ 0"; the embedder is pinned to its literal output vector rather than compared against a second call in the same process (which would pass for `Hasher` too, the very function that must not be used here).
-- **Concurrency tests have real concurrent writers.** `ConcurrentWriterTests` races 24 upserts, 8 drains, 8 deletes and 5 remote merges against one coordinator, then runs a cross-table invariant audit. The reentrancy tests use a continuation rendezvous, never a sleep, so the interleaving under test is the one requested on every run.
-- **Mutation-checked.** Three deliberate invariant breaks — making `isFresh` ignore epoch, flipping the delete-wins branch, and removing the IDF smoothing term — produced **10 test failures** on a run made for this release. The suite has teeth against exactly the bugs it claims to guard.
+- **Concurrency tests have real concurrent writers.** `ConcurrentWriterTests` races 24 upserts, 8 drains, 8 deletes and 5 remote merges against one coordinator, then runs a cross-table invariant audit. The reentrancy tests synchronise with a continuation rendezvous rather than a sleep, so the interleaving under test is the one requested on every run; the suite's one `Task.sleep` is a failure deadline, never a wait-and-assume.
+- **Mutation-checked, reproducibly.** `Scripts/mutation-check.sh` applies three deliberate invariant breaks to a *copy* of the tree — the epoch gate stops gating, delete-wins becomes edit-wins, the IDF smoothing term is removed — and runs the suite. It reports **10 failures**. The exact patches are committed rather than described, because the count depends on how each break is written, and a number nobody can re-derive is an assertion rather than evidence. Run it yourself.
 
 ---
 
 ## Using it
 
 ```swift
-.package(url: "https://github.com/rajatslakhina/semantic-index-sync-kit.git", from: "1.0.0")
+.package(url: "https://github.com/rajatslakhina/semantic-index-sync-kit.git", from: "2.0.0")
 ```
 
 ```swift
@@ -222,13 +222,14 @@ Run it yourself:
 ```bash
 swift build -Xswiftc -warnings-as-errors   # zero warnings, enforced
 swift test                                  # 98 tests
+./Scripts/mutation-check.sh                 # re-derive the mutation figure
 ```
 
 **What was actually verified for this release**, stated exactly:
 
 - **Clean build, zero warnings.** `rm -rf .build && swift build -Xswiftc -warnings-as-errors` with **Swift 6.1.2 on Linux (x86_64)** — a *clean* build, because an incremental one compiles nothing and still prints `Build complete!`.
 - **98 of 98 tests passing** under `swift test` on that toolchain.
-- **Mutation check:** three deliberate invariant breaks produced 10 failures, run locally before this release.
+- **Mutation check:** `Scripts/mutation-check.sh` → 10 failures, run before this release and reproducible on any machine with the toolchain.
 - **CI** runs the same clean build and test on Linux and on macOS, plus an iOS Simulator compile — and it passed on the `v2.0.0` commit, which is what establishes that `IndexWorkbenchView.swift` compiles at all (see below). Live status for every commit is on the [Actions tab](../../actions) — preferred over a run ID here, which goes stale on the next commit.
 
 **What is *not* covered locally, stated rather than left to be discovered.** `IndexWorkbenchView.swift` is behind `#if canImport(SwiftUI)`, so the Linux build compiles it to nothing — it was never compiled on the machine that produced this release. The `ios-simulator` CI job is the only thing that compiles it, and on the `v2.0.0` commit that job passed. Nothing here has been *run*, though: no Simulator launch, no screenshots. Compiling is not launching, and the two are never treated as the same claim. Everything else in `SemanticIndexSyncUI` — the view model, the configuration and the scenario builder — is deliberately **not** behind that guard, so it is compiled and tested on Linux like the rest.
