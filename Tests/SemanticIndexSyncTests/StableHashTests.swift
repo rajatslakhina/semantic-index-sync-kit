@@ -18,21 +18,29 @@ final class StableHashTests: XCTestCase {
         XCTAssertEqual(StableHash.fnv1a("thermal"), 5_790_970_284_486_884_672)
     }
 
-    func testDistinctInputsProduceDistinctBuckets() {
-        let inputs = ["battery", "thermal", "migration", "epoch", "tombstone"]
-        let hashes = Set(inputs.map { StableHash.fnv1a($0) })
-        XCTAssertEqual(hashes.count, inputs.count)
-    }
+    /// The embedder must produce the same vector in every process, forever,
+    /// because a vector written to disk today is compared against a query vector
+    /// produced by a different launch tomorrow.
+    ///
+    /// Asserting that two instances *in this process* agree would pass for
+    /// `Hasher` too, so the expectation is pinned to the exact values instead —
+    /// computed independently from the FNV-1a definition, not from this code.
+    func testEmbedderOutputIsPinnedAcrossProcesses() {
+        let epoch = EmbeddingEpoch(modelIdentifier: "test", revision: 1, dimension: 64)
+        let produced = DeterministicEmbeddingProvider(epoch: epoch).vector(for: "battery thermal budget")
 
-    /// The embedder must be a pure function of (epoch, text) with no hidden
-    /// per-instance state, because a vector written today is compared against a
-    /// query vector produced by a different instance tomorrow.
-    func testEmbedderIsStableAcrossInstances() {
-        let epoch = EmbeddingEpoch(modelIdentifier: "test", revision: 1, dimension: 16)
-        let first = DeterministicEmbeddingProvider(epoch: epoch).vector(for: "battery thermal budget")
-        let second = DeterministicEmbeddingProvider(epoch: epoch).vector(for: "battery thermal budget")
-        XCTAssertEqual(first, second)
-        XCTAssertEqual(first.count, 16)
+        XCTAssertEqual(produced.count, 64)
+
+        // Three tokens, three distinct buckets, unit length: each |value| is 1/√3.
+        let unit = 1.0 / 3.0.squareRoot()
+        var expected = [Double](repeating: 0, count: 64)
+        expected[15] = -unit
+        expected[45] = -unit
+        expected[47] = unit
+
+        for index in produced.indices {
+            XCTAssertEqual(produced[index], expected[index], accuracy: 1e-12, "bucket \(index)")
+        }
     }
 
     /// A revision bump must genuinely change the space. If it did not, every

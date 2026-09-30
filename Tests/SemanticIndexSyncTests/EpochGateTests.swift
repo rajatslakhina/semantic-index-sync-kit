@@ -8,42 +8,66 @@ final class EpochGateTests: XCTestCase {
 
     // MARK: The gate has teeth
 
-    /// The whole design rests on one claim: comparing vectors across epochs
-    /// produces a confident number that means nothing. This test demonstrates the
-    /// bug first — a cross-epoch cosine that scores *high enough to rank* — and
-    /// only then asserts the freshness gate rejects it.
+    /// The whole design rests on one claim: a vector from another embedding
+    /// space can score *arbitrarily well* and still mean nothing.
     ///
-    /// Assert the gate alone and the test would still pass against an
-    /// implementation that rejected everything.
-    func testCrossEpochCosineScoresPlausiblyYetTheGateStillRejectsIt() {
-        let text = "thermal budget pauses the re-index queue"
-        let oldVectorValues = DeterministicEmbeddingProvider(epoch: oldEpoch).vector(for: text)
-        let newVectorValues = DeterministicEmbeddingProvider(epoch: newEpoch).vector(for: text)
+    /// The demonstration uses explicitly constructed vectors rather than the
+    /// package's own embedder, because that embedder salts tokens with the
+    /// revision and therefore makes the two spaces orthogonal — a cross-epoch
+    /// cosine of exactly 0, which a naive implementation would *not* rank and
+    /// which would prove nothing. Real embedding models are not orthogonal
+    /// across revisions: retrained weights produce vectors that are numerically
+    /// close and semantically incomparable, which is precisely why the failure
+    /// is invisible. So the test builds that case directly: a stale vector that
+    /// scores 1.0, and a gate that rejects it anyway.
+    func testAStaleVectorScoringPerfectlyIsStillRejected() {
+        let values = VectorMath.l2Normalized((0..<24).map { Double(($0 % 7) + 1) })
+        let queryVector = values
 
-        // A naive implementation would compare these directly. The arithmetic
-        // succeeds and returns a finite, sortable number.
-        let naiveSimilarity = VectorMath.cosineSimilarity(newVectorValues, oldVectorValues)
-        XCTAssertTrue(naiveSimilarity.isFinite)
-        XCTAssertNotEqual(
-            oldVectorValues, newVectorValues,
-            "The two epochs must genuinely differ, or this test proves nothing."
+        // A naive implementation compares these directly. The arithmetic
+        // succeeds and returns the best possible score.
+        let naiveSimilarity = VectorMath.cosineSimilarity(queryVector, values)
+        XCTAssertEqual(
+            naiveSimilarity, 1.0, accuracy: 1e-12,
+            "The stale vector must score at the very top, or this test does not demonstrate the bug."
         )
 
-        // Same text, same epoch, for reference: this is what a real match is.
-        let honestSimilarity = VectorMath.cosineSimilarity(newVectorValues, newVectorValues)
-        XCTAssertEqual(honestSimilarity, 1.0, accuracy: 1e-9)
-
-        // The gate rejects the stale vector on epoch alone, whatever it scored.
         let chunk = Chunk(
             id: ChunkID(document: DocumentID("d"), ordinal: 0),
-            text: text,
+            text: "thermal budget pauses the re-index queue",
             sourceHash: ContentHash("h0")
         )
-        let stale = StoredVector(chunk: chunk.id, epoch: oldEpoch, sourceHash: chunk.sourceHash, values: oldVectorValues)
-        let fresh = StoredVector(chunk: chunk.id, epoch: newEpoch, sourceHash: chunk.sourceHash, values: newVectorValues)
+        let stale = StoredVector(chunk: chunk.id, epoch: oldEpoch, sourceHash: chunk.sourceHash, values: values)
+        let fresh = StoredVector(chunk: chunk.id, epoch: newEpoch, sourceHash: chunk.sourceHash, values: values)
 
+        // Same numbers, same perfect score, opposite verdicts — epoch alone decides.
         XCTAssertFalse(stale.isFresh(for: chunk, in: newEpoch))
         XCTAssertTrue(fresh.isFresh(for: chunk, in: newEpoch))
+    }
+
+    /// And the gate holds end to end: a chunk whose only vector is in the
+    /// previous epoch contributes nothing to semantic coverage, however well it
+    /// would have scored.
+    func testStaleEpochChunkIsExcludedFromSemanticCoverageEndToEnd() async {
+        let coordinator = IndexCoordinator(
+            device: DeviceID("phone"),
+            provider: DeterministicEmbeddingProvider(epoch: oldEpoch)
+        )
+        await coordinator.upsert(
+            document: DocumentID("d"),
+            passages: ["thermal budget pauses the re-index queue"],
+            hash: ContentHash("h0")
+        )
+        _ = await coordinator.drainMigration(budget: .foregroundInteractive, conditions: DeviceConditions())
+
+        let before = await coordinator.search("thermal budget", limit: 5)
+        XCTAssertEqual(before.completeness.semanticallyCovered, 1)
+
+        await coordinator.adopt(provider: DeterministicEmbeddingProvider(epoch: newEpoch))
+        let after = await coordinator.search("thermal budget", limit: 5)
+        XCTAssertEqual(after.completeness.semanticallyCovered, 0)
+        XCTAssertEqual(after.completeness.awaitingReindex, 1)
+        XCTAssertEqual(after.hits.first?.source, .lexicalFallback)
     }
 
     /// The second way a vector goes stale: the text moved, not the model.
@@ -90,13 +114,21 @@ final class EpochGateTests: XCTestCase {
         XCTAssertFalse(normalized.contains { $0.isNaN })
     }
 
-    func testNonFiniteInputsDoNotPoisonTheScore() {
-        let similarity = VectorMath.cosineSimilarity([Double.nan, 1, 0], [1, 1, 0])
-        XCTAssertTrue(similarity.isFinite)
-        XCTAssertTrue(similarity >= -1 && similarity <= 1)
+    /// A non-finite component is skipped, not propagated. Asserting only
+    /// `isFinite` would pass against an implementation that returned a constant,
+    /// so the exact expected value is asserted instead: with the NaN pair
+    /// dropped, `[_, 1, 0]` against `[_, 1, 0]` is a perfect match on what
+    /// remains.
+    func testNonFiniteInputsAreSkippedNotPropagated() {
+        XCTAssertEqual(VectorMath.cosineSimilarity([Double.nan, 1, 0], [1, 1, 0]), 1.0, accuracy: 1e-12)
+        XCTAssertEqual(VectorMath.cosineSimilarity([Double.nan, 3, 4], [1, 3, 4]), 1.0, accuracy: 1e-12)
+        // And a genuinely partial match still scores partially, so the skip is
+        // not silently zeroing the whole vector.
+        let partial = VectorMath.cosineSimilarity([Double.nan, 1, 1], [1, 1, 0])
+        XCTAssertEqual(partial, 1.0 / 2.0.squareRoot(), accuracy: 1e-12)
 
-        let normalized = VectorMath.l2Normalized([Double.infinity, 1])
-        XCTAssertFalse(normalized.contains { !$0.isFinite })
+        // Infinity is dropped before normalisation rather than producing NaN.
+        XCTAssertEqual(VectorMath.l2Normalized([Double.infinity, 1]), [0, 1])
     }
 
     func testEmptyVectorsScoreZero() {

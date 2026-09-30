@@ -63,10 +63,30 @@ final class WorkBudgetTests: XCTestCase {
         )
     }
 
-    func testThermalStatesAreOrdered() {
-        XCTAssertTrue(ThermalState.nominal < ThermalState.fair)
-        XCTAssertTrue(ThermalState.fair < ThermalState.serious)
-        XCTAssertTrue(ThermalState.serious < ThermalState.critical)
-        XCTAssertEqual(ThermalState.allCases.count, 4)
+    /// Asserting `rawValue` ordering would only restate the enum's declaration.
+    /// What matters is that the ordering is what `admits` actually consults, for
+    /// every state and every ceiling — so the whole ladder is walked.
+    func testAdmissionFollowsTheThermalLadderAtEveryCeiling() {
+        for ceiling in ThermalState.allCases {
+            let budget = WorkBudget(
+                maxChunksPerPass: 8,
+                thermalCeiling: ceiling,
+                requiresExternalPower: false,
+                batteryFloor: 0,
+                yieldsToLowPowerMode: false
+            )
+            for observed in ThermalState.allCases {
+                let rejection = budget.admits(DeviceConditions(thermalState: observed))
+                if observed.rawValue <= ceiling.rawValue {
+                    XCTAssertNil(rejection, "\(observed) should be admitted at ceiling \(ceiling)")
+                } else {
+                    XCTAssertEqual(
+                        rejection,
+                        .thermalCeilingExceeded(observed: observed, ceiling: ceiling),
+                        "\(observed) should be refused at ceiling \(ceiling)"
+                    )
+                }
+            }
+        }
     }
 }

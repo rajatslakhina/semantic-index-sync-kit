@@ -19,14 +19,34 @@ final class LexicalIndexTests: XCTestCase {
     }
 
     /// An unsmoothed Okapi IDF goes negative for a term present in every
-    /// document, which silently inverts ranking. The smoothing must hold it at or
-    /// above zero.
-    func testTermPresentInEveryChunkNeverScoresNegative() {
-        let corpus = (0..<5).map { chunk($0, "budget passage number \($0)") }
+    /// document, which silently inverts ranking.
+    ///
+    /// The unsmoothed formula is computed inline first and asserted to be
+    /// negative, so the test demonstrates that the trap is real before asserting
+    /// the implementation avoids it. `LexicalIndex` only stores entries scoring
+    /// above zero, so an unsmoothed implementation would return an *empty*
+    /// result here — which is exactly what the non-empty assertion catches.
+    func testUnsmoothedIDFWouldInvertRankingAndTheSmoothedOneDoesNot() {
+        let count = 5
+        let corpus = (0..<count).map { chunk($0, "budget passage number \($0)") }
+
+        // The bug, demonstrated: df == N, so the unsmoothed log argument is
+        // below 1 and the IDF is negative.
+        let documentFrequency = Double(count)
+        let unsmoothedArgument = (Double(count) - documentFrequency + 0.5) / (documentFrequency + 0.5)
+        XCTAssertLessThan(unsmoothedArgument, 1.0)
+        XCTAssertLessThan(
+            Foundation.log(unsmoothedArgument), 0.0,
+            "The unsmoothed IDF must be negative, or this test does not demonstrate the trap."
+        )
+
         let scores = LexicalIndex().scores(for: "budget", over: corpus)
-        XCTAssertFalse(scores.isEmpty)
+        XCTAssertEqual(
+            scores.count, count,
+            "Every chunk contains the term; a negative IDF would drop them all."
+        )
         for (id, score) in scores {
-            XCTAssertGreaterThanOrEqual(score, 0, "Negative score for \(id)")
+            XCTAssertGreaterThan(score, 0, "Non-positive score for \(id)")
             XCTAssertTrue(score.isFinite)
         }
     }
@@ -133,7 +153,13 @@ final class RankFusionTests: XCTestCase {
         XCTAssertEqual(hits.map(\.chunk.id), [corpus[0].id, corpus[1].id])
     }
 
-    func testNonFiniteScoresDoNotPropagate() {
+    /// A NaN score is treated as *no* score: the chunk it belonged to is
+    /// dropped, and the chunk that scored legitimately is unaffected.
+    ///
+    /// Asserting only `isFinite` on the results would pass against an
+    /// implementation that returned nothing at all, so exact membership, count
+    /// and value are asserted instead.
+    func testNonFiniteScoreIsTreatedAsNoScoreRatherThanPropagating() {
         let corpus = [chunk(0), chunk(1)]
         let hits = IndexCoordinator.rank(
             corpus: corpus,
@@ -141,14 +167,39 @@ final class RankFusionTests: XCTestCase {
             lexical: [corpus[1].id: 1.0],
             limit: 5
         )
+
+        // The NaN-only chunk contributes nothing usable, so it is omitted —
+        // not returned at some arbitrary finite score.
+        XCTAssertEqual(hits.count, 1)
+        XCTAssertEqual(hits.first?.chunk.id, corpus[1].id)
+        XCTAssertEqual(hits.first?.source, .lexicalFallback)
+        XCTAssertEqual(hits.first?.score ?? 0, 0.35, accuracy: 1e-12)
         for hit in hits { XCTAssertTrue(hit.score.isFinite) }
+
+        // And the surviving chunk's score is exactly what it would have been
+        // without the NaN present at all — the poison does not leak through
+        // the min-max normalisation.
+        let clean = IndexCoordinator.rank(
+            corpus: corpus, semantic: [:], lexical: [corpus[1].id: 1.0], limit: 5
+        )
+        XCTAssertEqual(clean.first?.score ?? -1, hits.first?.score ?? -2, accuracy: 1e-12)
     }
 
-    func testLimitIsRespected() {
+    /// Cardinality alone would pass against a `rank` that returned any three
+    /// chunks in any order, so the identity and order of the top slice are
+    /// asserted against deterministic scores.
+    func testLimitTakesTheHighestScoringSliceInOrder() {
         let corpus = (0..<10).map { chunk($0) }
-        let lexical = Dictionary(uniqueKeysWithValues: corpus.map { ($0.id, Double.random(in: 1...9)) })
+        // Descending, so the expected top three are chunks 0, 1, 2.
+        let lexical = Dictionary(
+            uniqueKeysWithValues: corpus.enumerated().map { ($0.element.id, Double(10 - $0.offset)) }
+        )
         let hits = IndexCoordinator.rank(corpus: corpus, semantic: [:], lexical: lexical, limit: 3)
+
         XCTAssertEqual(hits.count, 3)
+        XCTAssertEqual(hits.map(\.chunk.id), [corpus[0].id, corpus[1].id, corpus[2].id])
+        XCTAssertGreaterThan(hits[0].score, hits[1].score)
+        XCTAssertGreaterThan(hits[1].score, hits[2].score)
     }
 }
 

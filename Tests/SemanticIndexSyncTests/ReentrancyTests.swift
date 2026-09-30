@@ -83,6 +83,67 @@ final class ReentrancyTests: XCTestCase {
         XCTAssertEqual(result.completeness.awaitingReindex, 1)
     }
 
+    /// Two drains overlapping in time must not embed the same chunks twice.
+    ///
+    /// Without in-flight tracking, the second pass takes the same prefix of the
+    /// queue while the first is suspended inside the provider, both write the
+    /// same vectors, and both add their work to the migration counter — so a
+    /// three-passage corpus reports six of six migrated. That fabricated
+    /// denominator drives the demo's progress bar, and the duplicated embed
+    /// burns exactly the battery budget `WorkBudget` exists to conserve.
+    func testConcurrentDrainsDoNotEmbedTheSameChunksTwice() async {
+        let gate = Gate()
+        let coordinator = IndexCoordinator(
+            device: device,
+            provider: GatedProvider(epoch: epoch, gate: gate)
+        )
+        await coordinator.upsert(
+            document: DocumentID("d"),
+            passages: ["alpha passage", "beta passage", "gamma passage"],
+            hash: ContentHash("v1")
+        )
+
+        let first = Task { await coordinator.drainMigration(budget: .foregroundInteractive, conditions: DeviceConditions()) }
+        await gate.waitUntilEntered()
+
+        // Starts while the first pass is genuinely parked inside `embed`.
+        //
+        // Bounded, because without the in-flight guard the overlapping pass
+        // parks on the same gate and this call never returns — and a test that
+        // *hangs* under a mutation is not a test that catches it: XCTest has no
+        // per-test timeout here, so it would burn a CI job to the job ceiling
+        // with no failing assertion and no diagnostic. The deadline is a failure
+        // bound, not a synchronisation primitive; nothing in this suite waits a
+        // fixed time and then assumes something happened.
+        guard let second = await withDeadline(seconds: 5, {
+            await coordinator.drainMigration(budget: .foregroundInteractive, conditions: DeviceConditions())
+        }) else {
+            await gate.release()
+            _ = await first.value
+            return XCTFail("The overlapping pass never returned — it took the same work and parked on the provider.")
+        }
+        guard case .alreadyDraining = second else {
+            await gate.release()
+            _ = await first.value
+            return XCTFail("The overlapping pass must not take the same work; got \(second)")
+        }
+
+        await gate.release()
+        let firstOutcome = await first.value
+        guard case .finished(let progress) = firstOutcome else {
+            return XCTFail("Expected completion, got \(firstOutcome)")
+        }
+
+        XCTAssertEqual(progress.completed, 3, "Three passages, three embeddings — not six.")
+        XCTAssertEqual(progress.total, 3)
+        XCTAssertEqual(progress.remaining, 0)
+
+        let counts = await coordinator.vectorCountsByEpoch
+        XCTAssertEqual(counts[epoch], 3)
+        let violations = await coordinator.invariantViolations()
+        XCTAssertTrue(violations.isEmpty, "Violations: \(violations)")
+    }
+
     func testEpochBumpMidEmbedDiscardsVectorsForTheAbandonedSpace() async {
         let gate = Gate()
         let coordinator = IndexCoordinator(
@@ -102,7 +163,15 @@ final class ReentrancyTests: XCTestCase {
         await coordinator.adopt(provider: DeterministicEmbeddingProvider(epoch: bumped))
         await gate.release()
 
-        _ = await drain.value
+        // The outcome is the point of this test, so it is asserted rather than
+        // discarded. Reporting this as a *budget* deferral would be wrong twice
+        // over — the budget admitted the pass, and `adopt` rebuilt the queue —
+        // so it has its own case.
+        let outcome = await drain.value
+        guard case .abandoned(let supersededBy) = outcome else {
+            return XCTFail("Expected .abandoned, got \(outcome)")
+        }
+        XCTAssertEqual(supersededBy, bumped)
 
         let counts = await coordinator.vectorCountsByEpoch
         XCTAssertNil(counts[epoch], "A vector for the abandoned epoch was committed: \(counts)")
@@ -112,6 +181,46 @@ final class ReentrancyTests: XCTestCase {
         XCTAssertEqual(remainingCheck, 1)
         let violationsCheck = await coordinator.invariantViolations()
         XCTAssertTrue(violationsCheck.isEmpty, "Violations: \(violationsCheck)")
+    }
+}
+
+extension ReentrancyTests {
+
+    /// `adopt` rebuilds the queue underneath a pass that is still suspended in
+    /// the provider. If it does not also release that pass's claim, `inFlight`
+    /// no longer describes anything in the queue, and the next pass skips a
+    /// chunk nothing is working on — reporting `.alreadyDraining` about a pass
+    /// that no longer exists.
+    func testEpochBumpReleasesTheInFlightClaimOfTheAbandonedPass() async {
+        let gate = Gate()
+        let coordinator = IndexCoordinator(
+            device: device,
+            provider: GatedProvider(epoch: epoch, gate: gate)
+        )
+        await coordinator.upsert(
+            document: DocumentID("d"),
+            passages: ["first passage", "second passage"],
+            hash: ContentHash("v1")
+        )
+
+        let drain = Task { await coordinator.drainMigration(budget: .foregroundInteractive, conditions: DeviceConditions()) }
+        await gate.waitUntilEntered()
+
+        let bumped = EmbeddingEpoch(modelIdentifier: "system.text", revision: 9, dimension: 32)
+        await coordinator.adopt(provider: DeterministicEmbeddingProvider(epoch: bumped))
+
+        // Checked while the abandoned pass is still parked — this is the window
+        // the bug lived in.
+        let duringViolations = await coordinator.invariantViolations()
+        XCTAssertTrue(duringViolations.isEmpty, "Violations while a pass is abandoned mid-flight: \(duringViolations)")
+
+        await gate.release()
+        _ = await drain.value
+
+        let afterViolations = await coordinator.invariantViolations()
+        XCTAssertTrue(afterViolations.isEmpty, "Violations: \(afterViolations)")
+        let remaining = await coordinator.migrationProgress.remaining
+        XCTAssertEqual(remaining, 2)
     }
 }
 
@@ -184,6 +293,15 @@ final class ConcurrentWriterTests: XCTestCase {
         let result = await coordinator.search("queues budgets epochs", limit: 10)
         XCTAssertTrue(result.completeness.isComplete, "Summary: \(result.completeness.summary)")
         XCTAssertEqual(result.completeness.awaitingReindex, 0)
+
+        // The migration counter must describe the corpus, not the number of
+        // times a racing pass happened to run. A count above the live chunk
+        // total is the signature of duplicated work.
+        let progress = await coordinator.migrationProgress
+        let liveCount = await coordinator.liveChunks.count
+        XCTAssertEqual(progress.total, liveCount, "Migration total diverged from the corpus size.")
+        let vectorTotal = await coordinator.vectorCountsByEpoch.values.reduce(0, +)
+        XCTAssertEqual(vectorTotal, liveCount)
         let violationsCheck = await coordinator.invariantViolations()
         XCTAssertTrue(violationsCheck.isEmpty, "Violations: \(violationsCheck)")
         XCTAssertFalse(result.hits.isEmpty)

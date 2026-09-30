@@ -36,9 +36,9 @@ final class IndexCoordinatorTests: XCTestCase {
         for _ in 0..<32 {
             let outcome = await coordinator.drainMigration(budget: budget, conditions: DeviceConditions())
             switch outcome {
-            case .progressed: continue
+            case .progressed, .alreadyDraining: continue
             case .idle, .finished: return
-            case .deferred, .providerFailed: return
+            case .deferred, .providerFailed, .abandoned: return
             }
         }
     }
@@ -78,10 +78,26 @@ final class IndexCoordinatorTests: XCTestCase {
     func testNegativeAndOversizedLimitsAreHandled() async {
         let coordinator = await makeSeeded()
         await drainFully(coordinator)
+
         let none = await coordinator.search("thermal", limit: -5)
         XCTAssertTrue(none.hits.isEmpty)
+
+        // An oversized limit returns every chunk that scored in *either* space,
+        // which is 2 of the 4 — chunks sharing no token with the query score
+        // zero on both paths and are omitted rather than padded in at zero.
+        // Asserting the exact number rather than an upper bound, since `rank`
+        // caps by construction and `<= 4` would also pass on zero hits.
         let all = await coordinator.search("thermal", limit: 10_000)
-        XCTAssertLessThanOrEqual(all.hits.count, 4)
+        XCTAssertEqual(all.hits.count, 2)
+        // The top hit is the passage that actually discusses the query term;
+        // the second is a semantic-only match, which is the hybrid path working
+        // rather than a keyword filter.
+        XCTAssertTrue(all.hits[0].chunk.text.lowercased().contains("thermal"))
+        XCTAssertNotEqual(all.hits[0].source, .lexicalFallback)
+
+        let capped = await coordinator.search("thermal", limit: 1)
+        XCTAssertEqual(capped.hits.count, 1)
+        XCTAssertEqual(capped.hits.first?.chunk.id, all.hits.first?.chunk.id)
     }
 
     func testBlankPassagesAreNotIndexed() async {
@@ -167,34 +183,98 @@ final class IndexCoordinatorTests: XCTestCase {
     }
 
     /// Old vectors are retained on purpose, so a rollback is instant rather than
-    /// a second full re-index. This asserts the retention *and* the reclaim path.
-    func testPreviousEpochVectorsAreRetainedUntilExplicitlyDiscarded() async {
+    /// a second full re-index. Vectors are keyed by chunk *and* epoch precisely
+    /// so this holds; keying by chunk alone would overwrite the old space and
+    /// make the documented retention policy a dead letter.
+    func testPreviousEpochVectorsAreRetainedSoRollbackCostsNothing() async {
         let coordinator = await makeSeeded()
         await drainFully(coordinator)
         await coordinator.adopt(provider: DeterministicEmbeddingProvider(epoch: newEpoch))
         await drainFully(coordinator)
 
+        // Both spaces are on disk at once — that is the cost being paid.
         let counts = await coordinator.vectorCountsByEpoch
         XCTAssertEqual(counts[newEpoch], 4)
-        XCTAssertNil(counts[oldEpoch], "New vectors replace old ones for the same chunk.")
+        XCTAssertEqual(counts[oldEpoch], 4, "The previous epoch's vectors must survive the migration.")
 
-        // Rolling back finds every vector already present, so nothing is queued.
+        // And that is what it buys: rolling back queues nothing at all.
         let rollback = await coordinator.adopt(provider: DeterministicEmbeddingProvider(epoch: oldEpoch))
-        XCTAssertEqual(rollback.remaining, 4, "Vectors were overwritten, so a rollback does re-index.")
+        XCTAssertEqual(rollback.remaining, 0, "A rollback must not trigger a second re-index.")
+        XCTAssertEqual(rollback.completed, 4)
 
-        let discarded = await coordinator.discardVectors(outside: [oldEpoch])
-        XCTAssertGreaterThanOrEqual(discarded, 0)
-        let after = await coordinator.vectorCountsByEpoch
-        XCTAssertNil(after[newEpoch])
+        let recovered = await coordinator.search("thermal ceiling", limit: 5)
+        XCTAssertTrue(recovered.completeness.isComplete)
+        XCTAssertEqual(recovered.epoch, oldEpoch)
     }
 
+    /// Reclaiming the retained disk must not strand a chunk with no vector and
+    /// no queue entry — permanently unsearchable while every internal check
+    /// still reports the index healthy.
+    func testDiscardingTheActiveEpochRequeuesTheChunksItOrphaned() async {
+        let coordinator = await makeSeeded()
+        await drainFully(coordinator)
+        await coordinator.adopt(provider: DeterministicEmbeddingProvider(epoch: newEpoch))
+        await drainFully(coordinator)
+
+        // Discard everything except the epoch that is *not* active.
+        let discarded = await coordinator.discardVectors(outside: [oldEpoch])
+        XCTAssertEqual(discarded, 4, "Exactly the active epoch's four vectors are reclaimed.")
+
+        let counts = await coordinator.vectorCountsByEpoch
+        XCTAssertNil(counts[newEpoch])
+        XCTAssertEqual(counts[oldEpoch], 4)
+
+        // The orphaned chunks are back in the queue, not stranded.
+        let progress = await coordinator.migrationProgress
+        XCTAssertEqual(progress.remaining, 4)
+        let violations = await coordinator.invariantViolations()
+        XCTAssertTrue(violations.isEmpty, "Violations: \(violations)")
+
+        // And the index genuinely recovers.
+        await drainFully(coordinator)
+        let recovered = await coordinator.search("thermal ceiling", limit: 5)
+        XCTAssertTrue(recovered.completeness.isComplete)
+    }
+
+    /// Reclaiming an epoch nothing depends on must be a pure no-op on the queue.
+    ///
+    /// The complementary case — reclaiming the epoch that *is* active, which
+    /// genuinely orphans chunks — is covered by
+    /// `testDiscardingTheActiveEpochRequeuesTheChunksItOrphaned` above; this one
+    /// only guards against over-eager re-queueing.
+    func testDiscardingAnInactiveEpochQueuesNoWork() async {
+        let coordinator = await makeSeeded()
+        await drainFully(coordinator)
+        await coordinator.adopt(provider: DeterministicEmbeddingProvider(epoch: newEpoch))
+        await drainFully(coordinator)
+
+        let discarded = await coordinator.discardVectors(outside: [newEpoch])
+        XCTAssertEqual(discarded, 4)
+        let progress = await coordinator.migrationProgress
+        XCTAssertEqual(progress.remaining, 0)
+        let violations = await coordinator.invariantViolations()
+        XCTAssertTrue(violations.isEmpty, "Violations: \(violations)")
+    }
+
+    /// Asserting only `remaining == 0` would pass against an `adopt` that
+    /// returned a hardcoded empty progress, so the surrounding state is checked
+    /// too: the vectors must be untouched and a following drain must be idle.
     func testAdoptingTheSameEpochIsANoOp() async {
         let coordinator = await makeSeeded()
         await drainFully(coordinator)
-        let before = await coordinator.migrationProgress
+        let before = await coordinator.vectorCountsByEpoch
+
         let after = await coordinator.adopt(provider: DeterministicEmbeddingProvider(epoch: oldEpoch))
-        XCTAssertEqual(after.remaining, before.remaining)
         XCTAssertEqual(after.remaining, 0)
+        XCTAssertEqual(after.completed, 4)
+        XCTAssertEqual(after.targetEpoch, oldEpoch)
+
+        let unchanged = await coordinator.vectorCountsByEpoch
+        XCTAssertEqual(unchanged, before)
+        let drain = await coordinator.drainMigration(budget: .background, conditions: DeviceConditions())
+        XCTAssertEqual(drain, .idle)
+        let result = await coordinator.search("thermal ceiling", limit: 5)
+        XCTAssertTrue(result.completeness.isComplete)
     }
 
     // MARK: Degraded mode
@@ -375,5 +455,98 @@ final class IndexCoordinatorTests: XCTestCase {
         let result = await coordinator.search("backpressure", limit: 5)
         XCTAssertTrue(result.completeness.isComplete)
         XCTAssertEqual(result.hits.first?.chunk.text, "Rewritten passage about backpressure.")
+    }
+}
+
+/// The demo app's peer-sync scenario, asserted at the library level.
+///
+/// The demo's whole claim is that its sync button exercises a *concurrent*
+/// merge — the one case last-writer-wins cannot represent. Building the peer's
+/// records from the current local version would make them strictly newer, LWW
+/// would handle them correctly too, and the demonstration would be empty. This
+/// test fails if that regression is ever reintroduced.
+final class DemoSyncScenarioTests: XCTestCase {
+
+    private let local = DeviceID("iphone")
+    private let peer = DeviceID("ipad")
+    private let epoch = EmbeddingEpoch(modelIdentifier: "system.text", revision: 3, dimension: 32)
+
+    func testTheDemoScenarioReachesTheConcurrentBranch() async {
+        let coordinator = IndexCoordinator(
+            device: local,
+            provider: DeterministicEmbeddingProvider(epoch: epoch)
+        )
+        await coordinator.upsert(document: DocumentID("a"), passages: ["original a"], hash: ContentHash("a-v1"))
+        await coordinator.upsert(document: DocumentID("b"), passages: ["original b"], hash: ContentHash("b-v1"))
+
+        let live = await coordinator.exportManifest().filter { !$0.state.isTombstone }
+        XCTAssertEqual(live.count, 2)
+        guard let first = live.first, let second = live.dropFirst().first else {
+            return XCTFail("Seed documents missing.")
+        }
+
+        // The shared history, captured before either device diverges.
+        let sharedFirst = first.version
+        let sharedSecond = second.version
+
+        // This device edits both documents while offline.
+        await coordinator.upsert(document: first.id, passages: ["local edit a"], hash: ContentHash("a-local-edit"))
+        await coordinator.upsert(document: second.id, passages: ["local edit b"], hash: ContentHash("b-local-edit"))
+
+        // The peer, which never saw those edits, deletes one and edits the other.
+        let peerDelete = DocumentRecord(
+            id: first.id,
+            state: .tombstone,
+            version: sharedFirst.incrementing(peer),
+            lastWriter: peer
+        )
+        let peerEdit = DocumentRecord(
+            id: second.id,
+            state: .live(ContentHash("b-zz-peer-edit")),
+            version: sharedSecond.incrementing(peer),
+            lastWriter: peer
+        )
+
+        // Both are genuinely concurrent with what this device now holds.
+        let localNow = await coordinator.exportManifest()
+        guard let localFirst = localNow.first(where: { $0.id == first.id }),
+              let localSecond = localNow.first(where: { $0.id == second.id }) else {
+            return XCTFail("Local records missing.")
+        }
+        XCTAssertEqual(VersionVector.order(localFirst.version, peerDelete.version), .concurrent)
+        XCTAssertEqual(VersionVector.order(localSecond.version, peerEdit.version), .concurrent)
+
+        let report = await coordinator.applyRemote(
+            records: [peerDelete, peerEdit],
+            passages: [second.id: ["peer revision of b"]]
+        )
+
+        // Exactly what the demo's activity log promises.
+        XCTAssertEqual(report.concurrentResolved, 2)
+        XCTAssertEqual(report.tombstonesUpheld, 1)
+        XCTAssertEqual(report.supersededByRemote, 0)
+        XCTAssertEqual(report.staleRemotesIgnored, 0)
+
+        // The delete won its conflict and took its content with it.
+        let liveAfter = await coordinator.liveChunks.map(\.id.document)
+        XCTAssertFalse(liveAfter.contains(first.id))
+        XCTAssertTrue(liveAfter.contains(second.id))
+
+        // The peer's edit won on content hash, so its text is what is indexed.
+        await drain(coordinator)
+        let result = await coordinator.search("peer revision", limit: 5)
+        XCTAssertEqual(result.hits.first?.chunk.text, "peer revision of b")
+
+        let violations = await coordinator.invariantViolations()
+        XCTAssertTrue(violations.isEmpty, "Violations: \(violations)")
+    }
+
+    private func drain(_ coordinator: IndexCoordinator) async {
+        for _ in 0..<16 {
+            let outcome = await coordinator.drainMigration(budget: .foregroundInteractive, conditions: DeviceConditions())
+            if case .progressed = outcome { continue }
+            if case .alreadyDraining = outcome { continue }
+            return
+        }
     }
 }

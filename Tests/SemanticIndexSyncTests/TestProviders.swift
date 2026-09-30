@@ -110,3 +110,25 @@ struct MiscountingProvider: EmbeddingProvider {
         return texts.dropLast().map { base.vector(for: $0) }
     }
 }
+
+/// Runs `work`, returning `nil` if it has not finished within `seconds`.
+///
+/// Used only as a *failure bound* — so a test that would otherwise deadlock
+/// fails fast with a diagnostic instead of hanging until the CI job's ceiling.
+/// It is never used to wait a fixed time and then assume something happened;
+/// every actual synchronisation in this suite goes through `Gate`.
+func withDeadline<T: Sendable>(
+    seconds: Double,
+    _ work: @Sendable @escaping () async -> T
+) async -> T? {
+    await withTaskGroup(of: T?.self) { group in
+        group.addTask { await work() }
+        group.addTask {
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            return nil
+        }
+        let first = await group.next() ?? nil
+        group.cancelAll()
+        return first
+    }
+}
