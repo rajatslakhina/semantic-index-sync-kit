@@ -58,13 +58,16 @@ jobs:
       # pinning to `name=iPhone 16,OS=latest` ties the job to whichever
       # simulator runtimes happen to be installed on that day's runner image,
       # and they are not guaranteed. A compile-only check needs no device.
+      # No `| xcpretty`. GitHub Actions' default shell is `bash -e {0}` WITHOUT
+      # pipefail, so a pipeline's exit status is the last command's: xcpretty
+      # exits 0 even when xcodebuild failed, and this job — the only one that
+      # compiles the SwiftUI module at all — would go green on a broken build.
+      # `shell: bash` (which adds -eo pipefail) would also fix it; dropping the
+      # pipe is simpler and keeps the raw log.
       - name: Build for iOS Simulator
+        shell: bash
         run: |
-          xcodebuild build \
-            -scheme SemanticIndexSyncUI \
-            -destination 'generic/platform=iOS Simulator' \
-            -skipPackagePluginValidation \
-            CODE_SIGNING_ALLOWED=NO | xcpretty || \
+          set -euo pipefail
           xcodebuild build \
             -scheme SemanticIndexSyncUI \
             -destination 'generic/platform=iOS Simulator' \
