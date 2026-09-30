@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux (Swift 6.1)
+    runs-on: ubuntu-24.04
+    container: swift:6.1-noble
+    steps:
+      - uses: actions/checkout@v4
+
+      # A clean build, because `swift build` on an up-to-date tree compiles
+      # nothing and still prints "Build complete!". Without this the
+      # zero-warnings claim below would be evidence of nothing.
+      - name: Clean
+        run: rm -rf .build
+
+      # `-warnings-as-errors` makes the README's "zero warnings" claim
+      # machine-enforced rather than asserted in prose.
+      - name: Build (warnings are errors)
+        run: swift build -Xswiftc -warnings-as-errors
+
+      - name: Test
+        run: swift test
+
+  macos:
+    name: macOS (Xcode)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clean
+        run: rm -rf .build
+
+      - name: Build (warnings are errors)
+        run: swift build -Xswiftc -warnings-as-errors
+
+      - name: Test
+        run: swift test
+
+  ios-simulator:
+    name: iOS Simulator build
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # `generic/platform=iOS Simulator` deliberately, never a named device:
+      # pinning to `name=iPhone 16,OS=latest` ties the job to whichever
+      # simulator runtimes happen to be installed on that day's runner image,
+      # and they are not guaranteed. A compile-only check needs no device.
+      - name: Build for iOS Simulator
+        run: |
+          xcodebuild build \
+            -scheme SemanticIndexSyncUI \
+            -destination 'generic/platform=iOS Simulator' \
+            -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO | xcpretty || \
+          xcodebuild build \
+            -scheme SemanticIndexSyncUI \
+            -destination 'generic/platform=iOS Simulator' \
+            -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO
